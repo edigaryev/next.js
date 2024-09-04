@@ -1,4 +1,4 @@
-use std::path::MAIN_SEPARATOR;
+use std::{path::MAIN_SEPARATOR, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use indexmap::{indexmap, map::Entry, IndexMap};
@@ -74,6 +74,19 @@ pub struct DraftModeOptions {
     pub preview_mode_signing_key: RcStr,
 }
 
+#[derive(
+    Debug, Default, Serialize, Deserialize, Copy, Clone, TaskInput, PartialEq, Eq, Hash, TraceRawVcs,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchOptions {
+    /// Whether to watch the filesystem for file changes.
+    pub enable: bool,
+
+    /// Enable polling at a certain interval if the native file watching doesn't work (e.g.
+    /// docker).
+    pub poll_interval: Option<Duration>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, TaskInput, PartialEq, Eq, Hash, TraceRawVcs)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectOptions {
@@ -97,8 +110,8 @@ pub struct ProjectOptions {
     /// time.
     pub define_env: DefineEnv,
 
-    /// Whether to watch the filesystem for file changes.
-    pub watch: bool,
+    /// Filesystem watcher options.
+    pub watch: WatchOptions,
 
     /// The mode in which Next.js is running.
     pub dev: bool,
@@ -139,8 +152,8 @@ pub struct PartialProjectOptions {
     /// time.
     pub define_env: Option<DefineEnv>,
 
-    /// Whether to watch the filesystem for file changes.
-    pub watch: Option<bool>,
+    /// Filesystem watcher options.
+    pub watch: Option<WatchOptions>,
 
     /// The mode in which Next.js is running.
     pub dev: Option<bool>,
@@ -199,13 +212,16 @@ impl ProjectContainer {
 impl ProjectContainer {
     #[tracing::instrument(level = "info", name = "initialize project", skip_all)]
     pub async fn initialize(self: Vc<Self>, options: ProjectOptions) -> Result<()> {
+        let poll_interval = options.watch.poll_interval;
+
         self.await?.options_state.set(Some(options));
+
         let project = self.project();
         project
             .project_fs()
             .strongly_consistent()
             .await?
-            .start_watching_with_invalidation_reason()?;
+            .start_watching_with_invalidation_reason(poll_interval)?;
         project
             .output_fs()
             .strongly_consistent()
@@ -278,13 +294,15 @@ impl ProjectContainer {
         let prev_project_fs = project.project_fs().strongly_consistent().await?;
         let prev_output_fs = project.output_fs().strongly_consistent().await?;
 
+        let poll_interval = new_options.watch.poll_interval;
+
         this.options_state.set(Some(new_options));
         let project_fs = project.project_fs().strongly_consistent().await?;
         let output_fs = project.output_fs().strongly_consistent().await?;
 
         if !ReadRef::ptr_eq(&prev_project_fs, &project_fs) {
             // TODO stop watching: prev_project_fs.stop_watching()?;
-            project_fs.start_watching_with_invalidation_reason()?;
+            project_fs.start_watching_with_invalidation_reason(poll_interval)?;
         }
         if !ReadRef::ptr_eq(&prev_output_fs, &output_fs) {
             prev_output_fs.invalidate_with_reason();
@@ -405,8 +423,8 @@ pub struct Project {
     /// A path inside the root_path which contains the app/pages directories.
     pub project_path: RcStr,
 
-    /// Whether to watch the filesystem for file changes.
-    watch: bool,
+    /// Filesystem watcher options.
+    watch: WatchOptions,
 
     /// Next config.
     next_config: Vc<NextConfig>,
@@ -520,8 +538,10 @@ impl Project {
             this.root_path.clone(),
             vec![],
         );
-        if this.watch {
-            disk_fs.await?.start_watching_with_invalidation_reason()?;
+        if this.watch.enable {
+            disk_fs
+                .await?
+                .start_watching_with_invalidation_reason(this.watch.poll_interval)?;
         }
         Ok(disk_fs)
     }
